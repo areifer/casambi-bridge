@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 import time
-from copy import copy
 from typing import Any, cast
 
-from CasambiBt import Unit, UnitControlType, UnitState
+from CasambiBt import Unit, UnitControlType, _operation
 
 from homeassistant.components.cover import (
     ATTR_POSITION,
@@ -25,25 +24,34 @@ from .entities import CasambiUnitEntity, TypedEntityDescription
 
 _LOGGER = logging.getLogger(__name__)
 
+# Keywords in model names that indicate a cover/blind device
+_COVER_MODEL_KEYWORDS = ("blind", "shutter", "curtain", "roller", "sto", "motor", "cover")
+
 
 def is_cover_unit(unit: Unit) -> bool:
     """Return True if a unit is a shutter/blind/cover device.
 
-    Cover devices are identified by having SLIDER or dual ONOFF controls
-    without a DIMMER control. Devices with DIMMER are treated as lights.
+    Cover devices are identified by:
+    1. Having SLIDER control without DIMMER (motor/position, not a light)
+    2. Having 2+ ONOFF controls without DIMMER (dual relay for up/down)
+    3. Model name containing cover-related keywords as a fallback
     """
     controls = unit.unitType.controls
     control_types = {c.type for c in controls}
-
     has_dimmer = UnitControlType.DIMMER in control_types
 
-    # Pattern: has SLIDER but no DIMMER (motor/position control, not a light)
+    # Pattern 1: has SLIDER but no DIMMER (motor/position control)
     if UnitControlType.SLIDER in control_types and not has_dimmer:
         return True
 
-    # Pattern: has 2+ ONOFF but no DIMMER (dual relay for up/down)
+    # Pattern 2: has 2+ ONOFF but no DIMMER (dual relay for up/down)
     onoff_count = sum(1 for c in controls if c.type == UnitControlType.ONOFF)
     if onoff_count >= 2 and not has_dimmer:
+        return True
+
+    # Pattern 3: model name fallback
+    model_lower = unit.unitType.model.lower()
+    if any(kw in model_lower for kw in _COVER_MODEL_KEYWORDS):
         return True
 
     return False
@@ -62,7 +70,10 @@ async def async_setup_entry(
         if is_cover_unit(unit):
             entities.append(CasambiCover(casa_api, unit))
             _LOGGER.debug(
-                "Adding cover entity for unit: %s (uuid=%s)", unit.name, unit.uuid
+                "Adding cover entity for unit: %s (uuid=%s, model=%s)",
+                unit.name,
+                unit.uuid,
+                unit.unitType.model,
             )
 
     async_add_entities(entities)
@@ -78,9 +89,10 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         desc = TypedEntityDescription(key=unit.uuid, name=None, entity_type="cover")
 
         self._has_slider = unit.unitType.get_control(UnitControlType.SLIDER) is not None
-        self._has_dual_onoff = (
-            sum(1 for c in unit.unitType.controls if c.type == UnitControlType.ONOFF) >= 2
-        )
+        onoff_controls = [c for c in unit.unitType.controls if c.type == UnitControlType.ONOFF]
+        self._has_dual_onoff = len(onoff_controls) >= 2
+        # Store the individual ONOFF control descriptors for per-relay bit manipulation
+        self._onoff_controls = onoff_controls
 
         # For time-based position estimation on relay-only devices
         self._travel_time: float = DEFAULT_TRAVEL_TIME
@@ -90,6 +102,11 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
 
         self._obj: Unit
         super().__init__(api, desc, unit)
+
+    @property
+    def assumed_state(self) -> bool:
+        """Return True if the state is estimated (relay-only, no position feedback)."""
+        return not self._has_slider
 
     @property
     def supported_features(self) -> CoverEntityFeature:
@@ -132,7 +149,7 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         if self._has_slider:
             await self._api.casa.setSlider(unit, 255)
         elif self._has_dual_onoff:
-            await self._set_dual_relay(open_relay=True, close_relay=False)
+            await self._send_relay_state(open_on=True, close_on=False)
         self._start_moving("opening")
         self.async_write_ha_state()
 
@@ -142,7 +159,7 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         if self._has_slider:
             await self._api.casa.setSlider(unit, 0)
         elif self._has_dual_onoff:
-            await self._set_dual_relay(open_relay=False, close_relay=True)
+            await self._send_relay_state(open_on=False, close_on=True)
         self._start_moving("closing")
         self.async_write_ha_state()
 
@@ -150,11 +167,11 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         """Stop the cover."""
         unit = cast("Unit", self._obj)
         if self._has_slider:
-            # Send the current position to stop movement
+            # Re-send current position to halt motor
             if unit.state is not None and unit.state.slider is not None:
                 await self._api.casa.setSlider(unit, unit.state.slider)
         elif self._has_dual_onoff:
-            await self._set_dual_relay(open_relay=False, close_relay=False)
+            await self._send_relay_state(open_on=False, close_on=False)
         self._stop_moving()
         self.async_write_ha_state()
 
@@ -171,16 +188,41 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
                 self._start_moving("closing")
             self.async_write_ha_state()
 
-    async def _set_dual_relay(self, open_relay: bool, close_relay: bool) -> None:
-        """Set the dual OnOff relay states for open/close control."""
-        unit = cast("Unit", self._obj)
-        state = copy(unit.state) if unit.state else UnitState()
+    async def _send_relay_state(self, open_on: bool, close_on: bool) -> None:
+        """Set individual relay states using raw state byte manipulation.
 
-        onoff_controls = [c for c in unit.unitType.controls if c.type == UnitControlType.ONOFF]
-        if len(onoff_controls) >= 2:
-            # First OnOff = open/up relay, Second OnOff = close/down relay
-            state.onoff = open_relay or close_relay
-            await self._api.casa.setUnitState(unit, state)
+        UnitState only has a single onoff boolean which would set ALL ONOFF
+        controls to the same value. For dual-relay covers, we need to set
+        each relay independently by building raw state bytes and setting
+        individual bits at each control's offset.
+
+        Convention: first ONOFF control = open/up relay,
+                    second ONOFF control = close/down relay.
+        """
+        unit = cast("Unit", self._obj)
+        state_bytes = bytearray(unit.unitType.stateLength)
+
+        if len(self._onoff_controls) >= 2:
+            # Set the open/up relay bit
+            if open_on:
+                ctrl = self._onoff_controls[0]
+                state_bytes[ctrl.offset // 8] |= 1 << (ctrl.offset % 8)
+
+            # Set the close/down relay bit
+            if close_on:
+                ctrl = self._onoff_controls[1]
+                state_bytes[ctrl.offset // 8] |= 1 << (ctrl.offset % 8)
+
+        _LOGGER.debug(
+            "Sending relay state for %s: open=%s close=%s bytes=%s",
+            unit.name,
+            open_on,
+            close_on,
+            state_bytes.hex(),
+        )
+        await self._api.casa._send(  # noqa: SLF001
+            unit, bytes(state_bytes), _operation.OpCode.SetState
+        )
 
     def _start_moving(self, direction: str) -> None:
         """Track the start of cover movement for time-based estimation."""
@@ -209,7 +251,7 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
     def _change_callback(self, unit: Unit) -> None:
         """Handle state change from Casambi network."""
         if unit.state and self._has_slider:
-            # Clear movement tracking when we get a real state update
+            # Clear movement tracking when we get a real position update
             self._moving_since = None
             self._moving_direction = None
         super()._change_callback(unit)
