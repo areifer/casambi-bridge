@@ -90,11 +90,20 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
 
         self._has_slider = unit.unitType.get_control(UnitControlType.SLIDER) is not None
         onoff_controls = [c for c in unit.unitType.controls if c.type == UnitControlType.ONOFF]
-        self._has_dual_onoff = len(onoff_controls) >= 2
-        # Store the individual ONOFF control descriptors for per-relay bit manipulation.
-        # Devices with 4 ONOFF controls have: UP, DOWN (momentary), MAX UP, MAX DOWN (toggle).
-        # Momentary controls only move while held, so HA must use MAX UP/MAX DOWN (last two).
-        if len(onoff_controls) >= 4:
+        unkown_controls = [c for c in unit.unitType.controls if c.type == UnitControlType.UNKOWN]
+        self._has_dual_onoff = len(onoff_controls) >= 2 or len(unkown_controls) >= 2
+
+        # LIGA.AIR.STO.240 devices expose 4 controls:
+        #   UNKOWN@0 = UP (regular), UNKOWN@1 = DOWN (regular),
+        #   ONOFF@2 = MAX UP, ONOFF@3 = MAX DOWN.
+        # The Casambi app's normal up/down buttons use the UNKOWN controls.
+        # Some devices don't respond to MAX DOWN while regular DOWN works fine,
+        # so we prefer the UNKOWN controls when exactly 2 are available alongside
+        # 2 ONOFF controls (indicating the 4-control relay pattern).
+        if len(unkown_controls) == 2 and len(onoff_controls) == 2:
+            # Use regular UP/DOWN (more reliable) as primary controls.
+            self._onoff_controls = unkown_controls
+        elif len(onoff_controls) >= 4:
             self._onoff_controls = onoff_controls[2:4]
         else:
             self._onoff_controls = onoff_controls
@@ -118,7 +127,8 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
             )
         if self._has_dual_onoff:
             _LOGGER.debug(
-                "  Using ONOFF controls for open/close at offsets: %s",
+                "  Using controls for open/close: [%s] at offsets: %s",
+                ", ".join(c.type.name for c in self._onoff_controls),
                 [c.offset for c in self._onoff_controls],
             )
 
@@ -247,7 +257,7 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
                 state_bytes[off // 8] |= val_bytes[i]
                 off += 8 - off % 8
 
-        # Now override the ONOFF relay bits for our target controls.
+        # Now override the relay bits for our target up/down controls.
         if len(self._onoff_controls) >= 2:
             open_ctrl = self._onoff_controls[0]
             close_ctrl = self._onoff_controls[1]
