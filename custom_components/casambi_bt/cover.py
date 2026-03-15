@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, cast
@@ -209,6 +210,17 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
             if unit.state is not None and unit.state.slider is not None:
                 await self._api.casa.setSlider(unit, unit.state.slider)
         elif self._has_dual_onoff:
+            # Momentary relay controllers auto-reset to 0 after processing a
+            # command. If we just send both-off the device may see no state
+            # change and ignore it. Re-pulse the active direction first so the
+            # device sees a 1→0 transition, which it interprets as "stop".
+            if self._moving_direction == "opening":
+                await self._send_relay_state(open_on=True, close_on=False)
+            elif self._moving_direction == "closing":
+                await self._send_relay_state(open_on=False, close_on=True)
+            else:
+                await self._send_relay_state(open_on=True, close_on=True)
+            await asyncio.sleep(0.3)
             await self._send_relay_state(open_on=False, close_on=False)
         self._stop_moving()
         self.async_write_ha_state()
