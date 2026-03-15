@@ -263,11 +263,20 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
                 state_bytes[close_ctrl.offset // 8] |= 1 << (close_ctrl.offset % 8)
 
         _LOGGER.debug(
-            "Sending relay state for %s: open=%s close=%s bytes=%s",
+            "Sending relay state for %s: open=%s close=%s bytes=%s "
+            "| all_onoff_count=%d, selected_onoff_offsets=%s, "
+            "all_control_types=[%s], stateLength=%d",
             unit.name,
             open_on,
             close_on,
             state_bytes.hex(),
+            sum(1 for c in unit.unitType.controls if c.type == UnitControlType.ONOFF),
+            [c.offset for c in self._onoff_controls],
+            ", ".join(
+                f"{c.type.name}@{c.offset}(len={c.length},def={c.default})"
+                for c in unit.unitType.controls
+            ),
+            unit.unitType.stateLength,
         )
         await self._api.casa._send(  # noqa: SLF001
             unit, bytes(state_bytes), _operation.OpCode.SetState
