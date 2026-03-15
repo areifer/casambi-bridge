@@ -91,8 +91,19 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         self._has_slider = unit.unitType.get_control(UnitControlType.SLIDER) is not None
         onoff_controls = [c for c in unit.unitType.controls if c.type == UnitControlType.ONOFF]
         self._has_dual_onoff = len(onoff_controls) >= 2
-        # Store the individual ONOFF control descriptors for per-relay bit manipulation
-        self._onoff_controls = onoff_controls
+        # Store the individual ONOFF control descriptors for per-relay bit manipulation.
+        # Devices with 4 ONOFF controls have: UP, DOWN (momentary), MAX UP, MAX DOWN (toggle).
+        # Momentary controls only move while held, so HA must use MAX UP/MAX DOWN (last two).
+        if len(onoff_controls) >= 4:
+            self._onoff_controls = onoff_controls[2:4]
+            _LOGGER.debug(
+                "Unit %s has %d ONOFF controls; using last two (MAX UP/MAX DOWN) at offsets %s",
+                unit.name,
+                len(onoff_controls),
+                [c.offset for c in self._onoff_controls],
+            )
+        else:
+            self._onoff_controls = onoff_controls
 
         # For time-based position estimation on relay-only devices
         self._travel_time: float = DEFAULT_TRAVEL_TIME
