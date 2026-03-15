@@ -96,14 +96,31 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         # Momentary controls only move while held, so HA must use MAX UP/MAX DOWN (last two).
         if len(onoff_controls) >= 4:
             self._onoff_controls = onoff_controls[2:4]
-            _LOGGER.debug(
-                "Unit %s has %d ONOFF controls; using last two (MAX UP/MAX DOWN) at offsets %s",
-                unit.name,
-                len(onoff_controls),
-                [c.offset for c in self._onoff_controls],
-            )
         else:
             self._onoff_controls = onoff_controls
+
+        # Log all controls for diagnostic purposes (helps debug per-device issues).
+        _LOGGER.debug(
+            "Cover %s: model=%s, stateLength=%d, total_controls=%d, onoff_count=%d, "
+            "has_slider=%s, has_dual_onoff=%s",
+            unit.name,
+            unit.unitType.model,
+            unit.unitType.stateLength,
+            len(unit.unitType.controls),
+            len(onoff_controls),
+            self._has_slider,
+            self._has_dual_onoff,
+        )
+        for i, ctrl in enumerate(unit.unitType.controls):
+            _LOGGER.debug(
+                "  Control[%d]: type=%s offset=%d length=%d default=%d",
+                i, ctrl.type.name, ctrl.offset, ctrl.length, ctrl.default,
+            )
+        if self._has_dual_onoff:
+            _LOGGER.debug(
+                "  Using ONOFF controls for open/close at offsets: %s",
+                [c.offset for c in self._onoff_controls],
+            )
 
         # For time-based position estimation on relay-only devices
         self._travel_time: float = DEFAULT_TRAVEL_TIME
@@ -207,22 +224,43 @@ class CasambiCover(CoverEntity, CasambiUnitEntity):
         each relay independently by building raw state bytes and setting
         individual bits at each control's offset.
 
+        All non-target controls are filled with their default values (matching
+        the library's getStateAsBytes behaviour) so the device receives a
+        complete, valid state frame rather than mostly-zeroed bytes.
+
         Convention: first ONOFF control = open/up relay,
                     second ONOFF control = close/down relay.
         """
         unit = cast("Unit", self._obj)
         state_bytes = bytearray(unit.unitType.stateLength)
 
-        if len(self._onoff_controls) >= 2:
-            # Set the open/up relay bit
-            if open_on:
-                ctrl = self._onoff_controls[0]
-                state_bytes[ctrl.offset // 8] |= 1 << (ctrl.offset % 8)
+        # Populate default values for ALL controls first, so the device
+        # receives a valid state frame (some devices reject frames where
+        # non-relay controls are zeroed).
+        for ctrl in unit.unitType.controls:
+            val = ctrl.default
+            off = ctrl.offset
+            val <<= off % 8
+            byte_len = (ctrl.length + off % 8 - 1) // 8 + 1
+            val_bytes = val.to_bytes(byte_len, byteorder="little", signed=False)
+            for i in range(byte_len):
+                state_bytes[off // 8] |= val_bytes[i]
+                off += 8 - off % 8
 
-            # Set the close/down relay bit
+        # Now override the ONOFF relay bits for our target controls.
+        if len(self._onoff_controls) >= 2:
+            open_ctrl = self._onoff_controls[0]
+            close_ctrl = self._onoff_controls[1]
+
+            # Clear both relay bits first, then set the ones we want.
+            for ctrl in (open_ctrl, close_ctrl):
+                state_bytes[ctrl.offset // 8] &= ~(1 << (ctrl.offset % 8))
+
+            if open_on:
+                state_bytes[open_ctrl.offset // 8] |= 1 << (open_ctrl.offset % 8)
+
             if close_on:
-                ctrl = self._onoff_controls[1]
-                state_bytes[ctrl.offset // 8] |= 1 << (ctrl.offset % 8)
+                state_bytes[close_ctrl.offset // 8] |= 1 << (close_ctrl.offset % 8)
 
         _LOGGER.debug(
             "Sending relay state for %s: open=%s close=%s bytes=%s",
