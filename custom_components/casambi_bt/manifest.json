@@ -1,6 +1,6 @@
 {
   "domain": "casambi_bt",
-  "name": "Casambi Bluetooth",
+  "name": "Casambi Bluetooth (Cover & Blind Support)",
   "bluetooth": [
     {
       "service_uuid": "0000fe4d-0000-1000-8000-00805f9b34fb",
